@@ -4,7 +4,7 @@ compatibility_date = "2026-08-29"
 
 [vars]
 AI_BASE_URL = "https://api.apivn.tech/v1"
-AI_MODEL = "gpt-5-mini"
+AI_MODEL = "claude-fable-5"
 META_GRAPH_VERSION = "v26.0"
 AUTO_PUBLISH_FACEBOOK = "false"
 CONTENT_DUPLICATE_THRESHOLD = "0.72"
