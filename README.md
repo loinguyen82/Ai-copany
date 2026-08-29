@@ -62,34 +62,59 @@ All endpoints except `/health` require `Authorization: Bearer <ADMIN_TOKEN>`.
 - `ADMIN_TOKEN`
 - `AI_API_KEY`
 - `AI_BASE_URL` — defaults to `https://api.apivn.tech/v1`
-- `AI_MODEL`
+- `AI_MODEL` — deploy workflow re-checks `/v1/models` and selects an active model
 - `FB_PAGE_ID`
 - `FB_PAGE_ACCESS_TOKEN`
 - `META_GRAPH_VERSION` — defaults to `v26.0`
 - `AUTO_PUBLISH_FACEBOOK` — `false` by default
 - `CONTENT_DUPLICATE_THRESHOLD` — default `0.72`
 
-Secrets must be configured with Wrangler secrets, not committed to GitHub.
+Secrets must be configured as Worker/GitHub secrets, never committed.
 
-## Database
+## Standalone deploy
 
-New database:
+The repository has its own manual GitHub Action: `.github/workflows/deploy.yml`. It is intentionally separate from the APIVN application build.
+
+Required GitHub Actions secrets:
+
+- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_ACCOUNT_ID`
+- `APIVN_API_KEY`
+- `AI_COMPANY_ADMIN_TOKEN`
+
+Optional Facebook Page secrets:
+
+- `FB_PAGE_ID`
+- `FB_PAGE_ACCESS_TOKEN`
+
+The Cloudflare API token must be able to deploy Workers **and create/write D1 databases (`D1:Edit`)**. A token that can deploy Workers but lacks D1 permission will fail during first D1 provisioning.
+
+The manual deploy workflow:
+
+1. checks required secrets
+2. discovers an active APIVN model
+3. deploys the Worker and auto-provisions the `DB` D1 binding
+4. initializes or migrates the schema
+5. syncs Worker secrets
+6. deploys the final Worker
+7. smoke-tests health, Manager routing, dependency gating and content drafting
+
+Facebook publishing is not exercised by the smoke test.
+
+## Local development
 
 ```bash
 npm install
-npx wrangler d1 create ai-company
-# Put the returned database id into wrangler.toml and uncomment the D1 block.
-npx wrangler d1 execute ai-company --local --file=./schema.sql
 npm run dev
 ```
 
-Existing database created before coordination fields were added:
+`wrangler.toml` declares the D1 binding without a hard-coded database ID so Wrangler can provision/link it during deployment.
+
+Existing D1 databases created before coordination fields were added can be upgraded once with:
 
 ```bash
-npx wrangler d1 execute ai-company --remote --file=./migrations/0002_coordination.sql
+npx wrangler d1 execute DB --remote --file=./migrations/0002_coordination.sql --yes
 ```
-
-Apply that migration once.
 
 ## Facebook
 
