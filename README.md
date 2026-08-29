@@ -6,6 +6,10 @@ Minimal AI-company runtime: one Manager routes work to four specialist roles (re
 
 `Goal -> Manager -> Specialist -> Result -> Approval (when needed) -> External action -> Memory`
 
+Content flow:
+
+`Topic/notes -> AI angle + draft -> duplicate check -> approval -> Facebook Page -> publish history`
+
 The current external action included is Facebook Page publishing through Meta Graph API. Personal-profile auto posting is intentionally not supported.
 
 ## Endpoints
@@ -15,8 +19,20 @@ The current external action included is Facebook Page publishing through Meta Gr
 - `POST /tasks/:id/run`
 - `POST /tasks/:id/approve`
 - `GET /tasks/:id`
+- `POST /content/draft` body: `{ "topic": "...", "audience": "...", "objective": "...", "notes": "..." }`
+- `GET /content?limit=20`
+- `GET /content/:id`
+- `POST /content/:id/approve`
 
-All task endpoints require `Authorization: Bearer <ADMIN_TOKEN>`.
+All endpoints except `/health` require `Authorization: Bearer <ADMIN_TOKEN>`.
+
+## Content behavior
+
+`POST /content/draft` creates one Facebook Page draft and stores it in D1. The prompt explicitly blocks invented current facts, prices, statistics, customer results, and news. For time-sensitive claims, pass verified source material in `notes` until a real web-search connector is added.
+
+The worker compares each new draft with the latest 20 saved posts using a lightweight Jaccard similarity check. If the score reaches `CONTENT_DUPLICATE_THRESHOLD` (default `0.72`), it asks the model to rewrite the post with a materially different angle and structure.
+
+Default status is `awaiting_approval`. If `AUTO_PUBLISH_FACEBOOK=true`, the draft is stored first as `publishing`, posted to Facebook, then marked `published`. Failed publish attempts are kept as `publish_failed` rather than silently disappearing.
 
 ## Environment
 
@@ -27,7 +43,8 @@ All task endpoints require `Authorization: Bearer <ADMIN_TOKEN>`.
 - `FB_PAGE_ID` - Facebook Page ID
 - `FB_PAGE_ACCESS_TOKEN` - Page access token
 - `META_GRAPH_VERSION` - defaults to `v26.0`
-- `AUTO_PUBLISH_FACEBOOK` - `false` by default; set `true` only when you intentionally want automatic Page publishing
+- `AUTO_PUBLISH_FACEBOOK` - `false` by default
+- `CONTENT_DUPLICATE_THRESHOLD` - duplicate rewrite threshold, default `0.72`
 
 Secrets must be configured with Wrangler secrets, not committed to GitHub.
 
@@ -47,6 +64,6 @@ For production, apply `schema.sql` to the remote D1 database and configure secre
 
 Publishing uses `POST /{page-id}/feed` with a Page access token. Your Meta app/Page needs the relevant Page permissions, notably `pages_manage_posts`, plus Meta's production access requirements.
 
-Default behavior is safe: the marketing agent can prepare a post, but the task stops at `awaiting_approval`. Calling `/tasks/:id/approve` publishes it. If you later set `AUTO_PUBLISH_FACEBOOK=true`, a generated Facebook Page action publishes immediately after the agent finishes.
+Default behavior is safe: generated content stops at `awaiting_approval`. Calling `/content/:id/approve` publishes it. Set `AUTO_PUBLISH_FACEBOOK=true` only after the Page integration has been tested successfully.
 
 Use this for a Facebook **Page**, not a personal profile.
