@@ -16,5 +16,22 @@ CREATE TABLE IF NOT EXISTS memories (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS content_posts (
+  id TEXT PRIMARY KEY,
+  topic TEXT NOT NULL,
+  audience TEXT,
+  objective TEXT,
+  source_notes TEXT,
+  research_json TEXT,
+  message TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'awaiting_approval',
+  fb_post_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  published_at TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_content_posts_created_at ON content_posts(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_content_posts_status ON content_posts(status);
