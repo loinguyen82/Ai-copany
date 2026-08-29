@@ -24,7 +24,7 @@ Rules:
 - only one task can hold a resource lock at a time
 - a blocked task can be retried after the other task releases the resource
 - `approval_required` defaults to `true`
-- Facebook publishing also locks the target Page as an external resource
+- Facebook actions executed through the generic task flow lock the target Page during the external write
 
 Example:
 
