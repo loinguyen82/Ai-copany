@@ -9,8 +9,6 @@ META_GRAPH_VERSION = "v26.0"
 AUTO_PUBLISH_FACEBOOK = "false"
 CONTENT_DUPLICATE_THRESHOLD = "0.72"
 
-# After creating D1, uncomment and fill this block.
-# [[d1_databases]]
-# binding = "DB"
-# database_name = "ai-company"
-# database_id = "YOUR_D1_DATABASE_ID"
+# Wrangler automatically provisions D1 on first deploy and keeps the binding linked.
+[[d1_databases]]
+binding = "DB"
