@@ -1,0 +1,139 @@
+name: Deploy AI Company
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      APIVN_API_KEY: ${{ secrets.APIVN_API_KEY }}
+      AI_COMPANY_ADMIN_TOKEN: ${{ secrets.AI_COMPANY_ADMIN_TOKEN }}
+      FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+      FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID APIVN_API_KEY AI_COMPANY_ADMIN_TOKEN; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::$name is missing"
+              exit 1
+            fi
+          done
+
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      - name: Select active APIVN model
+        shell: bash
+        run: |
+          set -euo pipefail
+          models="$(curl -fsS --max-time 20 https://api.apivn.tech/v1/models)"
+          model="$(printf '%s' "$models" | jq -r 'if (.data | map(.id) | index("gpt-5-mini")) != null then "gpt-5-mini" else .data[0].id // empty end')"
+          if [ -z "$model" ]; then
+            echo '::error::APIVN returned no active model'
+            exit 1
+          fi
+          sed -i "s/^AI_MODEL = .*/AI_MODEL = \"$model\"/" wrangler.toml
+          echo "Using model: $model"
+
+      - name: Provision Worker and D1
+        run: npx wrangler deploy
+
+      - name: Initialize or migrate D1
+        shell: bash
+        run: |
+          set -euo pipefail
+          info="$(npx wrangler d1 execute DB --remote --command 'PRAGMA table_info(tasks)' --json)"
+          columns="$(printf '%s' "$info" | jq -r '.[0].results[]?.name')"
+
+          if ! printf '%s\n' "$columns" | grep -qx goal; then
+            npx wrangler d1 execute DB --remote --file=./schema.sql --yes
+          else
+            if ! printf '%s\n' "$columns" | grep -qx owner_agent; then
+              npx wrangler d1 execute DB --remote --file=./migrations/0002_coordination.sql --yes
+            fi
+            npx wrangler d1 execute DB --remote --file=./schema.sql --yes
+          fi
+
+      - name: Sync Worker secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$APIVN_API_KEY" | npx wrangler secret put AI_API_KEY >/dev/null
+          printf '%s' "$AI_COMPANY_ADMIN_TOKEN" | npx wrangler secret put ADMIN_TOKEN >/dev/null
+
+          if [ -n "${FB_PAGE_ID:-}" ] && [ -n "${FB_PAGE_ACCESS_TOKEN:-}" ]; then
+            printf '%s' "$FB_PAGE_ID" | npx wrangler secret put FB_PAGE_ID >/dev/null
+            printf '%s' "$FB_PAGE_ACCESS_TOKEN" | npx wrangler secret put FB_PAGE_ACCESS_TOKEN >/dev/null
+            echo 'Facebook Page credentials synced.'
+          fi
+
+      - name: Final deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx wrangler deploy 2>&1 | tee /tmp/deploy.log
+          worker_url="$(grep -Eo 'https://[A-Za-z0-9._-]+\.workers\.dev' /tmp/deploy.log | tail -1)"
+          if [ -z "$worker_url" ]; then
+            echo '::error::Could not determine workers.dev URL'
+            exit 1
+          fi
+          echo "WORKER_URL=$worker_url" >> "$GITHUB_ENV"
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          auth="Authorization: Bearer $AI_COMPANY_ADMIN_TOKEN"
+
+          health="$(curl -fsS --max-time 20 "$WORKER_URL/health")"
+          printf '%s' "$health" | jq -e '.ok == true and .database == true' >/dev/null
+
+          first="$(curl -fsS --max-time 20 -X POST "$WORKER_URL/tasks" \
+            -H "$auth" -H 'content-type: application/json' \
+            --data '{"goal":"Return a concise daily monitoring summary for APIVN. Do not perform an external action.","approval_required":false}')"
+          first_id="$(printf '%s' "$first" | jq -r '.id')"
+          test -n "$first_id"
+
+          dependency="$(curl -fsS --max-time 20 -X POST "$WORKER_URL/tasks" \
+            -H "$auth" -H 'content-type: application/json' \
+            --data "{\"goal\":\"Dependency gate check\",\"depends_on\":\"$first_id\",\"approval_required\":false}")"
+          dependency_id="$(printf '%s' "$dependency" | jq -r '.id')"
+
+          blocked_code="$(curl -sS -o /tmp/dependency.json -w '%{http_code}' --max-time 20 -X POST \
+            "$WORKER_URL/tasks/$dependency_id/run" -H "$auth")"
+          test "$blocked_code" = 409
+          jq -e '.error == "dependency_not_completed"' /tmp/dependency.json >/dev/null
+
+          run="$(curl -fsS --max-time 120 -X POST "$WORKER_URL/tasks/$first_id/run" -H "$auth")"
+          test "$(printf '%s' "$run" | jq -r '.status')" = completed
+          owner="$(printf '%s' "$run" | jq -r '.owner_agent')"
+          case "$owner" in research|product|marketing|sales|operations|risk) ;; *) echo "::error::invalid owner_agent=$owner"; exit 1;; esac
+
+          after="$(curl -fsS --max-time 120 -X POST "$WORKER_URL/tasks/$dependency_id/run" -H "$auth")"
+          test "$(printf '%s' "$after" | jq -r '.status')" = completed
+
+          draft="$(curl -fsS --max-time 120 -X POST "$WORKER_URL/content/draft" \
+            -H "$auth" -H 'content-type: application/json' \
+            --data '{"topic":"Why an AI API gateway is useful","audience":"Vietnamese developers","objective":"educate","notes":"Do not claim current prices or statistics."}')"
+          test "$(printf '%s' "$draft" | jq -r '.status')" = awaiting_approval
+          test -n "$(printf '%s' "$draft" | jq -r '.message')"
+
+          echo "PASS worker=$WORKER_URL owner=$owner content=awaiting_approval"
