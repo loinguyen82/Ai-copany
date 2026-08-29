@@ -1,54 +1,79 @@
 # Ai-copany
 
-Minimal AI-company runtime: one Manager routes work to four specialist roles (research, product, marketing, operations), stores task history/memory in Cloudflare D1, and requires approval for risky external actions by default.
+Minimal AI-company runtime for APIVN.tech. One Manager routes each task to exactly one specialist team, stores task/memory state in Cloudflare D1, prevents concurrent writes to the same resource, and keeps risky external actions behind approval by default.
 
-## MVP flow
+## Teams
 
-`Goal -> Manager -> Specialist -> Result -> Approval (when needed) -> External action -> Memory`
+- `research` — strategy, market, competitors, evidence
+- `product` — product + development analysis, patches/test plans
+- `marketing` — content and marketing
+- `sales` — sales + customer success
+- `operations` — operations + finance analysis
+- `risk` — risk + legal + security review
 
-Content flow:
+Specialists do not delegate to each other. Only the Manager assigns ownership.
+
+## Coordination
+
+`Goal -> Manager -> one owner -> optional resource lock -> result -> approval -> external action -> memory`
+
+Rules:
+- one task has one `owner_agent`
+- `depends_on` must be `completed` before a task can run
+- write-like work can declare a stable `resource`
+- only one task can hold a resource lock at a time
+- a blocked task can be retried after the other task releases the resource
+- `approval_required` defaults to `true`
+- Facebook publishing also locks the target Page as an external resource
+
+Example:
+
+```json
+{
+  "goal": "Prepare a Facebook post about the new APIVN pricing explanation",
+  "resource": "marketing:facebook:pricing-post",
+  "depends_on": null,
+  "approval_required": true
+}
+```
+
+## Content flow
 
 `Topic/notes -> AI angle + draft -> duplicate check -> approval -> Facebook Page -> publish history`
 
-The current external action included is Facebook Page publishing through Meta Graph API. Personal-profile auto posting is intentionally not supported.
+Personal-profile auto posting is intentionally not supported. For a personal profile, use the dashboard/copy flow and publish manually.
 
 ## Endpoints
 
 - `GET /health` (public)
-- `POST /tasks` body: `{ "goal": "..." }`
+- `POST /tasks`
 - `POST /tasks/:id/run`
 - `POST /tasks/:id/approve`
 - `GET /tasks/:id`
-- `POST /content/draft` body: `{ "topic": "...", "audience": "...", "objective": "...", "notes": "..." }`
+- `POST /content/draft`
 - `GET /content?limit=20`
 - `GET /content/:id`
 - `POST /content/:id/approve`
 
 All endpoints except `/health` require `Authorization: Bearer <ADMIN_TOKEN>`.
 
-## Content behavior
-
-`POST /content/draft` creates one Facebook Page draft and stores it in D1. The prompt explicitly blocks invented current facts, prices, statistics, customer results, and news. For time-sensitive claims, pass verified source material in `notes` until a real web-search connector is added.
-
-The worker compares each new draft with the latest 20 saved posts using a lightweight Jaccard similarity check. If the score reaches `CONTENT_DUPLICATE_THRESHOLD` (default `0.72`), it asks the model to rewrite the post with a materially different angle and structure.
-
-Default status is `awaiting_approval`. If `AUTO_PUBLISH_FACEBOOK=true`, the draft is stored first as `publishing`, posted to Facebook, then marked `published`. Failed publish attempts are kept as `publish_failed` rather than silently disappearing.
-
 ## Environment
 
-- `ADMIN_TOKEN` - protects the task/control API
-- `AI_API_KEY` - OpenAI-compatible API key
-- `AI_BASE_URL` - defaults to `https://api.apivn.tech/v1`
-- `AI_MODEL` - model name
-- `FB_PAGE_ID` - Facebook Page ID
-- `FB_PAGE_ACCESS_TOKEN` - Page access token
-- `META_GRAPH_VERSION` - defaults to `v26.0`
-- `AUTO_PUBLISH_FACEBOOK` - `false` by default
-- `CONTENT_DUPLICATE_THRESHOLD` - duplicate rewrite threshold, default `0.72`
+- `ADMIN_TOKEN`
+- `AI_API_KEY`
+- `AI_BASE_URL` — defaults to `https://api.apivn.tech/v1`
+- `AI_MODEL`
+- `FB_PAGE_ID`
+- `FB_PAGE_ACCESS_TOKEN`
+- `META_GRAPH_VERSION` — defaults to `v26.0`
+- `AUTO_PUBLISH_FACEBOOK` — `false` by default
+- `CONTENT_DUPLICATE_THRESHOLD` — default `0.72`
 
 Secrets must be configured with Wrangler secrets, not committed to GitHub.
 
-## Run
+## Database
+
+New database:
 
 ```bash
 npm install
@@ -58,12 +83,20 @@ npx wrangler d1 execute ai-company --local --file=./schema.sql
 npm run dev
 ```
 
-For production, apply `schema.sql` to the remote D1 database and configure secrets before deploying.
+Existing database created before coordination fields were added:
 
-## Facebook auto-post
+```bash
+npx wrangler d1 execute ai-company --remote --file=./migrations/0002_coordination.sql
+```
 
-Publishing uses `POST /{page-id}/feed` with a Page access token. Your Meta app/Page needs the relevant Page permissions, notably `pages_manage_posts`, plus Meta's production access requirements.
+Apply that migration once.
 
-Default behavior is safe: generated content stops at `awaiting_approval`. Calling `/content/:id/approve` publishes it. Set `AUTO_PUBLISH_FACEBOOK=true` only after the Page integration has been tested successfully.
+## Facebook
 
-Use this for a Facebook **Page**, not a personal profile.
+Publishing uses the Facebook Page Graph API. Generated content stops at `awaiting_approval` by default.
+
+Generic tasks only auto-publish when both conditions are true:
+- `AUTO_PUBLISH_FACEBOOK=true`
+- the task was created with `approval_required=false`
+
+This prevents a global auto-publish switch from silently bypassing per-task approval.
