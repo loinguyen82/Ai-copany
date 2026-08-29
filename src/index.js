@@ -1,10 +1,12 @@
 import { handleContentRequest } from './content.js';
 
 const AGENTS = {
-  research: 'Find and verify information. Separate facts from assumptions. Return concise evidence-backed findings.',
-  product: 'Turn goals into the smallest useful product or code change. Prefer patching and KISS/YAGNI.',
-  marketing: 'Create practical marketing output tied to a measurable goal. Avoid spam and deceptive claims.',
-  operations: 'Handle repeatable operations safely. Flag actions that change external systems or spend money.'
+  research: 'Research strategy, market, competitors and evidence. Separate facts from assumptions and never invent current information.',
+  product: 'Own product and development analysis. Turn goals into the smallest useful requirement, patch or test plan. Prefer KISS/YAGNI.',
+  marketing: 'Own marketing and content. Create practical output tied to a measurable goal. Avoid spam, fake urgency and deceptive claims.',
+  sales: 'Own sales and customer success work. Qualify needs, draft helpful follow-ups and surface customer risks without pretending to be a human.',
+  operations: 'Own repeatable operations and finance analysis. Track usage, cost, margin and operational health. Never spend or transfer money without approval.',
+  risk: 'Own risk, legal and security review. Identify concrete issues, permissions, data exposure and compliance concerns. Default risky writes to human approval.'
 };
 
 export default {
@@ -102,7 +104,6 @@ async function runTask(env, id) {
   }
 
   await setStatus(env, id, 'running');
-
   let lockedResource = null;
 
   try {
@@ -118,9 +119,9 @@ async function runTask(env, id) {
       {
         role: 'system',
         content:
-          'You are the only manager allowed to assign work in a tiny AI company. ' +
-          'Route the goal to exactly one specialist: research, product, marketing, or operations. ' +
-          'Specialists never delegate to each other. Return JSON only: ' +
+          'You are the only manager allowed to assign work in APIVN AI Company. ' +
+          'Route the goal to exactly one specialist: research, product, marketing, sales, operations, or risk. ' +
+          'Specialists never delegate to each other and never change task ownership themselves. Return JSON only: ' +
           '{"agent":"...","instructions":"...","resource":null} or ' +
           '{"agent":"...","instructions":"...","resource":"stable-resource-key"}. ' +
           'Use resource=null for read-only work. For work that may write or change one shared thing, ' +
@@ -171,7 +172,7 @@ async function runTask(env, id) {
         content:
           `${AGENTS[agent]} You are the ${agent} specialist. ` +
           'You execute only the manager instructions. You must not delegate, call another agent, ' +
-          'or expand the scope. Output JSON only with this shape: ' +
+          'change task ownership, or expand the scope. Output JSON only with this shape: ' +
           '{"summary":"...","memory":"...","action":null} or ' +
           '{"summary":"...","memory":"...","action":{"type":"facebook_page_post","message":"..."}}. ' +
           'Only request facebook_page_post when publishing a Page post is genuinely part of the goal.'
@@ -268,18 +269,12 @@ async function approveTask(env, id) {
 }
 
 async function executeExternalAction(env, task, ownerAgent, action) {
-  if (action.type !== 'facebook_page_post') {
-    throw new Error('unsupported action type');
-  }
+  if (action.type !== 'facebook_page_post') throw new Error('unsupported action type');
 
   const externalResource = `facebook:page:${env.FB_PAGE_ID || 'unconfigured'}`;
   const lock = await acquireResourceLock(env, externalResource, task.id, ownerAgent);
   if (!lock.ok) {
-    const error = new Error(
-      `resource_locked:${externalResource}:${lock.task_id}:${lock.owner_agent}`
-    );
-    error.code = 'RESOURCE_LOCKED';
-    throw error;
+    throw new Error(`resource_locked:${externalResource}:${lock.task_id}:${lock.owner_agent}`);
   }
 
   try {
@@ -307,9 +302,7 @@ async function acquireResourceLock(env, resource, taskId, ownerAgent) {
     'SELECT task_id, owner_agent FROM resource_locks WHERE resource = ?'
   ).bind(resource).first();
 
-  if (lock?.task_id === taskId) {
-    return { ok: true, task_id: taskId, owner_agent: ownerAgent };
-  }
+  if (lock?.task_id === taskId) return { ok: true, task_id: taskId, owner_agent: ownerAgent };
 
   return {
     ok: false,
