@@ -43,7 +43,7 @@ export async function handleContentRequest(request, env, helpers) {
       }
     ]);
 
-    let draft = parseAIJson(raw);
+    const draft = parseAIJson(raw);
     let message = String(draft.message || '').trim();
     if (!message) return json({ error: 'AI returned an empty post' }, 502);
 
@@ -69,14 +69,9 @@ export async function handleContentRequest(request, env, helpers) {
 
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
-    let status = 'awaiting_approval';
+    const autoPublish = env.AUTO_PUBLISH_FACEBOOK === 'true';
+    let status = autoPublish ? 'publishing' : 'awaiting_approval';
     let fbPostId = null;
-
-    if (env.AUTO_PUBLISH_FACEBOOK === 'true') {
-      const result = await publishFacebook(env, message);
-      fbPostId = String(result?.id || '');
-      status = 'published';
-    }
 
     await env.DB.prepare(
       `INSERT INTO content_posts
@@ -91,11 +86,28 @@ export async function handleContentRequest(request, env, helpers) {
       JSON.stringify(draft.research || {}),
       message,
       status,
-      fbPostId,
+      null,
       now,
       now,
-      status === 'published' ? now : null
+      null
     ).run();
+
+    if (autoPublish) {
+      try {
+        const result = await publishFacebook(env, message);
+        fbPostId = String(result?.id || '');
+        status = 'published';
+        const publishedAt = new Date().toISOString();
+        await env.DB.prepare(
+          'UPDATE content_posts SET status = ?, fb_post_id = ?, published_at = ?, updated_at = ? WHERE id = ?'
+        ).bind(status, fbPostId, publishedAt, publishedAt, id).run();
+      } catch (error) {
+        await env.DB.prepare(
+          'UPDATE content_posts SET status = ?, updated_at = ? WHERE id = ?'
+        ).bind('publish_failed', new Date().toISOString(), id).run();
+        throw error;
+      }
+    }
 
     return json({
       id,
@@ -118,18 +130,29 @@ export async function handleContentRequest(request, env, helpers) {
   if (method === 'POST' && approveMatch) {
     const post = await getPost(env, approveMatch[1]);
     if (!post) return json({ error: 'content post not found' }, 404);
-    if (post.status !== 'awaiting_approval') {
+    if (!['awaiting_approval', 'publish_failed'].includes(post.status)) {
       return json({ error: `post cannot be approved from status ${post.status}` }, 409);
     }
 
-    const result = await publishFacebook(env, post.message);
-    const now = new Date().toISOString();
-    const fbPostId = String(result?.id || '');
+    const startedAt = new Date().toISOString();
     await env.DB.prepare(
-      'UPDATE content_posts SET status = ?, fb_post_id = ?, published_at = ?, updated_at = ? WHERE id = ?'
-    ).bind('published', fbPostId, now, now, post.id).run();
+      'UPDATE content_posts SET status = ?, updated_at = ? WHERE id = ?'
+    ).bind('publishing', startedAt, post.id).run();
 
-    return json({ id: post.id, status: 'published', fb_post_id: fbPostId });
+    try {
+      const result = await publishFacebook(env, post.message);
+      const now = new Date().toISOString();
+      const fbPostId = String(result?.id || '');
+      await env.DB.prepare(
+        'UPDATE content_posts SET status = ?, fb_post_id = ?, published_at = ?, updated_at = ? WHERE id = ?'
+      ).bind('published', fbPostId, now, now, post.id).run();
+      return json({ id: post.id, status: 'published', fb_post_id: fbPostId });
+    } catch (error) {
+      await env.DB.prepare(
+        'UPDATE content_posts SET status = ?, updated_at = ? WHERE id = ?'
+      ).bind('publish_failed', new Date().toISOString(), post.id).run();
+      throw error;
+    }
   }
 
   return null;
