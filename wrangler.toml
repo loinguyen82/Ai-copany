@@ -7,6 +7,7 @@ AI_BASE_URL = "https://api.apivn.tech/v1"
 AI_MODEL = "gpt-5-mini"
 META_GRAPH_VERSION = "v26.0"
 AUTO_PUBLISH_FACEBOOK = "false"
+CONTENT_DUPLICATE_THRESHOLD = "0.72"
 
 # After creating D1, uncomment and fill this block.
 # [[d1_databases]]
