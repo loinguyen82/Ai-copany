@@ -38,13 +38,31 @@ export default {
         const goal = String(body.goal || '').trim();
         if (!goal) return json({ error: 'goal is required' }, 400);
 
+        const resource = normalizeResource(body.resource);
+        const dependsOn = normalizeId(body.depends_on);
+        const approvalRequired = body.approval_required === false ? 0 : 1;
+
+        if (dependsOn) {
+          const dependency = await getTask(env, dependsOn);
+          if (!dependency) return json({ error: 'depends_on task not found' }, 400);
+        }
+
         const id = crypto.randomUUID();
         const now = new Date().toISOString();
         await env.DB.prepare(
-          'INSERT INTO tasks (id, goal, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)'
-        ).bind(id, goal, 'queued', now, now).run();
+          `INSERT INTO tasks
+           (id, goal, resource, depends_on, approval_required, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(id, goal, resource, dependsOn, approvalRequired, 'queued', now, now).run();
 
-        return json({ id, goal, status: 'queued' }, 201);
+        return json({
+          id,
+          goal,
+          resource,
+          depends_on: dependsOn,
+          approval_required: Boolean(approvalRequired),
+          status: 'queued'
+        }, 201);
       }
 
       const taskMatch = url.pathname.match(/^\/tasks\/([^/]+)$/);
@@ -70,11 +88,22 @@ export default {
 async function runTask(env, id) {
   const task = await getTask(env, id);
   if (!task) return json({ error: 'task not found' }, 404);
-  if (!['queued', 'failed'].includes(task.status)) {
+  if (!['queued', 'failed', 'blocked'].includes(task.status)) {
     return json({ error: `task cannot run from status ${task.status}` }, 409);
   }
 
+  const dependency = await checkDependency(env, task);
+  if (!dependency.ok) {
+    return json({
+      error: 'dependency_not_completed',
+      depends_on: task.depends_on,
+      dependency_status: dependency.status
+    }, 409);
+  }
+
   await setStatus(env, id, 'running');
+
+  let lockedResource = null;
 
   try {
     const memories = await env.DB.prepare(
@@ -89,39 +118,86 @@ async function runTask(env, id) {
       {
         role: 'system',
         content:
-          'You are the manager of a tiny AI company. Route the goal to exactly one specialist: research, product, marketing, or operations. Do not invent extra agents. Output JSON only: {"agent":"...","instructions":"..."}.'
+          'You are the only manager allowed to assign work in a tiny AI company. ' +
+          'Route the goal to exactly one specialist: research, product, marketing, or operations. ' +
+          'Specialists never delegate to each other. Return JSON only: ' +
+          '{"agent":"...","instructions":"...","resource":null} or ' +
+          '{"agent":"...","instructions":"...","resource":"stable-resource-key"}. ' +
+          'Use resource=null for read-only work. For work that may write or change one shared thing, ' +
+          'use a stable resource key identifying that thing so concurrent tasks cannot modify it.'
       },
       {
         role: 'user',
-        content: `Company memory:\n${memoryText || '(empty)'}\n\nGoal:\n${task.goal}`
+        content:
+          `Company memory:\n${memoryText || '(empty)'}\n\n` +
+          `Requested resource override: ${task.resource || '(none)'}\n` +
+          `Goal:\n${task.goal}`
       }
     ]);
 
     const plan = parseAIJson(manager);
     const agent = AGENTS[plan.agent] ? plan.agent : 'operations';
     const instructions = String(plan.instructions || task.goal);
+    const effectiveResource = task.resource || normalizeResource(plan.resource);
+
+    await env.DB.prepare(
+      'UPDATE tasks SET agent = ?, owner_agent = ?, resource = ?, plan_json = ?, updated_at = ? WHERE id = ?'
+    ).bind(
+      agent,
+      agent,
+      effectiveResource,
+      JSON.stringify({ ...plan, agent, resource: effectiveResource }),
+      new Date().toISOString(),
+      id
+    ).run();
+
+    if (effectiveResource) {
+      const lock = await acquireResourceLock(env, effectiveResource, id, agent);
+      if (!lock.ok) {
+        await setStatus(env, id, 'blocked');
+        return json({
+          error: 'resource_locked',
+          resource: effectiveResource,
+          locked_by_task: lock.task_id,
+          locked_by_agent: lock.owner_agent
+        }, 409);
+      }
+      lockedResource = effectiveResource;
+    }
 
     const worker = await callAI(env, [
       {
         role: 'system',
         content:
           `${AGENTS[agent]} You are the ${agent} specialist. ` +
-          'Output JSON only with this shape: {"summary":"...","memory":"...","action":null} or {"summary":"...","memory":"...","action":{"type":"facebook_page_post","message":"..."}}. ' +
+          'You execute only the manager instructions. You must not delegate, call another agent, ' +
+          'or expand the scope. Output JSON only with this shape: ' +
+          '{"summary":"...","memory":"...","action":null} or ' +
+          '{"summary":"...","memory":"...","action":{"type":"facebook_page_post","message":"..."}}. ' +
           'Only request facebook_page_post when publishing a Page post is genuinely part of the goal.'
       },
       {
         role: 'user',
-        content: `Manager instructions:\n${instructions}\n\nOriginal goal:\n${task.goal}`
+        content:
+          `Manager instructions:\n${instructions}\n\n` +
+          `Owned resource: ${effectiveResource || '(read-only / none)'}\n\n` +
+          `Original goal:\n${task.goal}`
       }
     ]);
 
     const result = parseAIJson(worker);
     const action = normalizeAction(result.action);
+    const approvalRequired = Number(task.approval_required ?? 1) !== 0;
+
     let status = action ? 'awaiting_approval' : 'completed';
     let externalResult = null;
 
-    if (action?.type === 'facebook_page_post' && env.AUTO_PUBLISH_FACEBOOK === 'true') {
-      externalResult = await publishFacebook(env, action.message);
+    if (
+      action?.type === 'facebook_page_post' &&
+      env.AUTO_PUBLISH_FACEBOOK === 'true' &&
+      !approvalRequired
+    ) {
+      externalResult = await executeExternalAction(env, task, agent, action);
       status = 'completed';
     }
 
@@ -134,8 +210,8 @@ async function runTask(env, id) {
 
     const now = new Date().toISOString();
     await env.DB.prepare(
-      'UPDATE tasks SET agent = ?, plan_json = ?, result_json = ?, status = ?, updated_at = ? WHERE id = ?'
-    ).bind(agent, JSON.stringify(plan), JSON.stringify(storedResult), status, now, id).run();
+      'UPDATE tasks SET result_json = ?, status = ?, updated_at = ? WHERE id = ?'
+    ).bind(JSON.stringify(storedResult), status, now, id).run();
 
     if (storedResult.memory) {
       await env.DB.prepare(
@@ -143,10 +219,19 @@ async function runTask(env, id) {
       ).bind(agent, storedResult.memory, now).run();
     }
 
-    return json({ id, agent, status, result: storedResult });
+    return json({
+      id,
+      owner_agent: agent,
+      resource: effectiveResource,
+      status,
+      approval_required: approvalRequired,
+      result: storedResult
+    });
   } catch (error) {
     await setStatus(env, id, 'failed');
     throw error;
+  } finally {
+    if (lockedResource) await releaseResourceLock(env, lockedResource, id);
   }
 }
 
@@ -157,16 +242,21 @@ async function approveTask(env, id) {
     return json({ error: `task is not awaiting approval (${task.status})` }, 409);
   }
 
+  const dependency = await checkDependency(env, task);
+  if (!dependency.ok) {
+    return json({
+      error: 'dependency_not_completed',
+      depends_on: task.depends_on,
+      dependency_status: dependency.status
+    }, 409);
+  }
+
   const result = safeJson(task.result_json) || {};
   const action = normalizeAction(result.action);
   if (!action) return json({ error: 'task has no approvable action' }, 409);
 
-  let externalResult;
-  if (action.type === 'facebook_page_post') {
-    externalResult = await publishFacebook(env, action.message);
-  } else {
-    return json({ error: 'unsupported action type' }, 400);
-  }
+  const ownerAgent = task.owner_agent || task.agent || 'operations';
+  const externalResult = await executeExternalAction(env, task, ownerAgent, action);
 
   result.external_result = externalResult;
   const now = new Date().toISOString();
@@ -175,6 +265,63 @@ async function approveTask(env, id) {
   ).bind(JSON.stringify(result), 'completed', now, id).run();
 
   return json({ id, status: 'completed', result });
+}
+
+async function executeExternalAction(env, task, ownerAgent, action) {
+  if (action.type !== 'facebook_page_post') {
+    throw new Error('unsupported action type');
+  }
+
+  const externalResource = `facebook:page:${env.FB_PAGE_ID || 'unconfigured'}`;
+  const lock = await acquireResourceLock(env, externalResource, task.id, ownerAgent);
+  if (!lock.ok) {
+    const error = new Error(
+      `resource_locked:${externalResource}:${lock.task_id}:${lock.owner_agent}`
+    );
+    error.code = 'RESOURCE_LOCKED';
+    throw error;
+  }
+
+  try {
+    return await publishFacebook(env, action.message);
+  } finally {
+    await releaseResourceLock(env, externalResource, task.id);
+  }
+}
+
+async function checkDependency(env, task) {
+  if (!task.depends_on) return { ok: true, status: null };
+  const dependency = await getTask(env, task.depends_on);
+  if (!dependency) return { ok: false, status: 'missing' };
+  return { ok: dependency.status === 'completed', status: dependency.status };
+}
+
+async function acquireResourceLock(env, resource, taskId, ownerAgent) {
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO resource_locks (resource, task_id, owner_agent, acquired_at)
+     VALUES (?, ?, ?, ?)`
+  ).bind(resource, taskId, ownerAgent, now).run();
+
+  const lock = await env.DB.prepare(
+    'SELECT task_id, owner_agent FROM resource_locks WHERE resource = ?'
+  ).bind(resource).first();
+
+  if (lock?.task_id === taskId) {
+    return { ok: true, task_id: taskId, owner_agent: ownerAgent };
+  }
+
+  return {
+    ok: false,
+    task_id: lock?.task_id || null,
+    owner_agent: lock?.owner_agent || null
+  };
+}
+
+async function releaseResourceLock(env, resource, taskId) {
+  await env.DB.prepare(
+    'DELETE FROM resource_locks WHERE resource = ? AND task_id = ?'
+  ).bind(resource, taskId).run();
 }
 
 async function publishFacebook(env, message) {
@@ -222,7 +369,7 @@ async function callAI(env, messages) {
 }
 
 function parseAIJson(text) {
-  const cleaned = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+  const cleaned = String(text).trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
   try {
     return JSON.parse(cleaned);
   } catch {
@@ -237,6 +384,19 @@ function normalizeAction(action) {
   if (!action || typeof action !== 'object' || action.type !== 'facebook_page_post') return null;
   const message = String(action.message || '').trim();
   return message ? { type: 'facebook_page_post', message } : null;
+}
+
+function normalizeResource(value) {
+  if (value === null || value === undefined) return null;
+  const resource = String(value).trim().toLowerCase().replace(/\s+/g, '-');
+  if (!resource) return null;
+  return resource.slice(0, 200);
+}
+
+function normalizeId(value) {
+  if (value === null || value === undefined) return null;
+  const id = String(value).trim();
+  return id || null;
 }
 
 async function getTask(env, id) {
@@ -254,6 +414,10 @@ function formatTask(task) {
     id: task.id,
     goal: task.goal,
     agent: task.agent,
+    owner_agent: task.owner_agent || task.agent || null,
+    resource: task.resource || null,
+    depends_on: task.depends_on || null,
+    approval_required: Number(task.approval_required ?? 1) !== 0,
     plan: safeJson(task.plan_json),
     result: safeJson(task.result_json),
     status: task.status,
