@@ -8,14 +8,18 @@ const AGENTS = {
 export default {
   async fetch(request, env) {
     try {
-      if (!env.DB) return json({ error: 'DB binding is not configured' }, 503);
-
       const url = new URL(request.url);
       const method = request.method.toUpperCase();
 
       if (method === 'GET' && url.pathname === '/health') {
-        return json({ ok: true, service: 'ai-copany' });
+        return json({ ok: true, service: 'ai-copany', database: Boolean(env.DB) });
       }
+
+      if (!env.ADMIN_TOKEN) return json({ error: 'ADMIN_TOKEN is not configured' }, 503);
+      if (request.headers.get('authorization') !== `Bearer ${env.ADMIN_TOKEN}`) {
+        return json({ error: 'unauthorized' }, 401);
+      }
+      if (!env.DB) return json({ error: 'DB binding is not configured' }, 503);
 
       if (method === 'POST' && url.pathname === '/tasks') {
         const body = await readJson(request);
@@ -38,14 +42,10 @@ export default {
       }
 
       const runMatch = url.pathname.match(/^\/tasks\/([^/]+)\/run$/);
-      if (method === 'POST' && runMatch) {
-        return await runTask(env, runMatch[1]);
-      }
+      if (method === 'POST' && runMatch) return runTask(env, runMatch[1]);
 
       const approveMatch = url.pathname.match(/^\/tasks\/([^/]+)\/approve$/);
-      if (method === 'POST' && approveMatch) {
-        return await approveTask(env, approveMatch[1]);
-      }
+      if (method === 'POST' && approveMatch) return approveTask(env, approveMatch[1]);
 
       return json({ error: 'not found' }, 404);
     } catch (error) {
@@ -172,10 +172,7 @@ async function publishFacebook(env, message) {
 
   const version = env.META_GRAPH_VERSION || 'v26.0';
   const url = `https://graph.facebook.com/${version}/${encodeURIComponent(env.FB_PAGE_ID)}/feed`;
-  const body = new URLSearchParams({
-    message,
-    access_token: env.FB_PAGE_ACCESS_TOKEN
-  });
+  const body = new URLSearchParams({ message, access_token: env.FB_PAGE_ACCESS_TOKEN });
 
   const response = await fetch(url, {
     method: 'POST',
@@ -187,7 +184,6 @@ async function publishFacebook(env, message) {
   if (!response.ok || data.error) {
     throw new Error(`Facebook publish failed: ${JSON.stringify(data.error || data)}`);
   }
-
   return data;
 }
 
@@ -202,20 +198,14 @@ async function callAI(env, messages) {
       authorization: `Bearer ${env.AI_API_KEY}`,
       'content-type': 'application/json'
     },
-    body: JSON.stringify({
-      model: env.AI_MODEL,
-      messages,
-      temperature: 0.2
-    })
+    body: JSON.stringify({ model: env.AI_MODEL, messages, temperature: 0.2 })
   });
 
   const data = await response.json();
   if (!response.ok) throw new Error(`AI request failed: ${JSON.stringify(data)}`);
 
   const content = data?.choices?.[0]?.message?.content;
-  if (typeof content !== 'string' || !content.trim()) {
-    throw new Error('AI returned no text content');
-  }
+  if (typeof content !== 'string' || !content.trim()) throw new Error('AI returned no text content');
   return content;
 }
 
@@ -232,11 +222,9 @@ function parseAIJson(text) {
 }
 
 function normalizeAction(action) {
-  if (!action || typeof action !== 'object') return null;
-  if (action.type !== 'facebook_page_post') return null;
+  if (!action || typeof action !== 'object' || action.type !== 'facebook_page_post') return null;
   const message = String(action.message || '').trim();
-  if (!message) return null;
-  return { type: 'facebook_page_post', message };
+  return message ? { type: 'facebook_page_post', message } : null;
 }
 
 async function getTask(env, id) {
