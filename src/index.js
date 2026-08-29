@@ -1,3 +1,5 @@
+import { handleContentRequest } from './content.js';
+
 const AGENTS = {
   research: 'Find and verify information. Separate facts from assumptions. Return concise evidence-backed findings.',
   product: 'Turn goals into the smallest useful product or code change. Prefer patching and KISS/YAGNI.',
@@ -20,6 +22,16 @@ export default {
         return json({ error: 'unauthorized' }, 401);
       }
       if (!env.DB) return json({ error: 'DB binding is not configured' }, 503);
+
+      if (url.pathname === '/content' || url.pathname.startsWith('/content/')) {
+        const contentResponse = await handleContentRequest(request, env, {
+          callAI,
+          publishFacebook,
+          json,
+          readJson
+        });
+        if (contentResponse) return contentResponse;
+      }
 
       if (method === 'POST' && url.pathname === '/tasks') {
         const body = await readJson(request);
