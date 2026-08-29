@@ -1,0 +1,15 @@
+name = "ai-copany"
+main = "src/index.js"
+compatibility_date = "2026-08-29"
+
+[vars]
+AI_BASE_URL = "https://api.apivn.tech/v1"
+AI_MODEL = "gpt-5-mini"
+META_GRAPH_VERSION = "v26.0"
+AUTO_PUBLISH_FACEBOOK = "false"
+
+# After creating D1, uncomment and fill this block.
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "ai-company"
+# database_id = "YOUR_D1_DATABASE_ID"
